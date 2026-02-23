@@ -110,8 +110,10 @@ const ORDERS_TABLET_MIN_WIDTH = 900;
 const UI_PREF_USER_KEY = "default";
 const UI_PREF_PAGE_KEY = "orders";
 const UI_PREF_KEY_LEFT_PANE = "left_pane_width_desktop";
+const UI_PREF_KEY_BUSINESS_TZ_MODE = "business_tz_mode";
 const UI_PREF_LOCAL_FALLBACK_KEY = `orderly_ui_pref_v1:${UI_PREF_USER_KEY}:${UI_PREF_PAGE_KEY}:${UI_PREF_KEY_LEFT_PANE}`;
 const DAY_MS = 24 * 60 * 60 * 1000;
+type BusinessTimeZoneMode = "local" | "utc";
 
 type OrderFileEntry = {
   relPath: string;
@@ -137,6 +139,15 @@ type AmountAdjustmentRecord = {
   deltaCents: number;
   reason: string;
   atMs: number;
+  createdAtMs: number;
+};
+
+type ArchiveEventRecord = {
+  id: string;
+  orderId: string;
+  eventType: "archive" | "unarchive";
+  month: string | null;
+  reason: string;
   createdAtMs: number;
 };
 
@@ -298,7 +309,21 @@ export default function App() {
     return `${y}-${m}`;
   }
 
+  function getSystemTimeZone(): string {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone || "System Local";
+    } catch {
+      return "System Local";
+    }
+  }
+
+  function normalizeBusinessTimeZoneMode(raw: unknown): BusinessTimeZoneMode {
+    const mode = String(raw ?? "").trim().toLowerCase();
+    return mode === "utc" ? "utc" : "local";
+  }
+
   const tauriRuntime = isTauriRuntime();
+  const systemTimeZone = useMemo(() => getSystemTimeZone(), []);
   const [activeMenu, setActiveMenu] = useState<"orders" | "stats" | "settings">("orders");
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<OrderStatus | "all">("all");
@@ -310,6 +335,8 @@ export default function App() {
   const [archiveOverview, setArchiveOverview] = useState<ArchiveMonthOverviewItem[]>([]);
   const [statsMonth, setStatsMonth] = useState<string>(() => getCurrentMonthValue());
   const [monthlySummary, setMonthlySummary] = useState<MonthlyIncomeSummary | null>(null);
+  const [businessTimeZoneMode, setBusinessTimeZoneMode] = useState<BusinessTimeZoneMode>("local");
+  const [isSavingBusinessTimeZoneMode, setIsSavingBusinessTimeZoneMode] = useState(false);
   const [orders, setOrders] = useState<OrderListItem[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [hasMoreOrders, setHasMoreOrders] = useState(false);
@@ -319,6 +346,7 @@ export default function App() {
   const [expandedDirs, setExpandedDirs] = useState<Record<string, boolean>>({});
   const [payments, setPayments] = useState<PaymentRecord[]>([]);
   const [adjustments, setAdjustments] = useState<AmountAdjustmentRecord[]>([]);
+  const [archiveEvents, setArchiveEvents] = useState<ArchiveEventRecord[]>([]);
   const [isPaymentOpen, setIsPaymentOpen] = useState(false);
   const [editingPaymentId, setEditingPaymentId] = useState<string | null>(null);
   const [paymentDraft, setPaymentDraft] = useState({
@@ -556,6 +584,30 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    invokeCommand<UiPrefGetOutput>("ui_pref_get", {
+      input: {
+        userKey: UI_PREF_USER_KEY,
+        pageKey: UI_PREF_PAGE_KEY,
+        prefKey: UI_PREF_KEY_BUSINESS_TZ_MODE,
+      },
+    })
+      .then((res) => {
+        if (cancelled) return;
+        setBusinessTimeZoneMode(normalizeBusinessTimeZoneMode(res?.prefValue));
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setBusinessTimeZoneMode("local");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
     const onResize = () => {
       setLeftPaneWidth((curr) => {
         const next = clampLeftPaneWidth(curr);
@@ -693,6 +745,11 @@ export default function App() {
     setAdjustments(a);
   }
 
+  async function refreshArchiveEvents(orderId: string) {
+    const res = await invokeCommand<ArchiveEventRecord[]>("archive_events_list", { orderId });
+    setArchiveEvents(res);
+  }
+
   async function refreshArchiveOverview() {
     const res = await invokeCommand<ArchiveMonthOverviewItem[]>("archive_months_overview");
     setArchiveOverview(res);
@@ -703,6 +760,33 @@ export default function App() {
     if (!normalized) return;
     const res = await invokeCommand<MonthlyIncomeSummary>("monthly_income_summary", { month: normalized });
     setMonthlySummary(res);
+  }
+
+  async function saveBusinessTimeZoneMode(nextMode: BusinessTimeZoneMode) {
+    const normalized = normalizeBusinessTimeZoneMode(nextMode);
+    const prev = businessTimeZoneMode;
+    if (normalized === prev) return;
+
+    setBusinessTimeZoneMode(normalized);
+    setIsSavingBusinessTimeZoneMode(true);
+    try {
+      await invokeCommand("ui_pref_set", {
+        input: {
+          userKey: UI_PREF_USER_KEY,
+          pageKey: UI_PREF_PAGE_KEY,
+          prefKey: UI_PREF_KEY_BUSINESS_TZ_MODE,
+          prefValue: normalized,
+        },
+      });
+      await refreshMonthlySummary(statsMonth);
+      await refreshArchiveOverview();
+      setDebugBox(`统计时区策略已切换为：${normalized === "utc" ? "UTC" : "系统本地时区"}`);
+    } catch (e) {
+      setBusinessTimeZoneMode(prev);
+      showGlobalError(e, "保存统计时区策略失败");
+    } finally {
+      setIsSavingBusinessTimeZoneMode(false);
+    }
   }
 
   useEffect(() => {
@@ -720,6 +804,15 @@ export default function App() {
     refreshMoney(selected.id).catch((e) => showGlobalError(e, "加载金额流水失败"));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected?.id]);
+
+  useEffect(() => {
+    if (!selected?.id) {
+      setArchiveEvents([]);
+      return;
+    }
+    refreshArchiveEvents(selected.id).catch((e) => showGlobalError(e, "加载归档历史失败"));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected?.id, orders]);
 
   useEffect(() => {
     refreshArchiveOverview().catch((e) => showGlobalError(e, "加载归档月份失败"));
@@ -834,6 +927,17 @@ export default function App() {
         return "尾款";
       case "other":
         return "其他";
+      default:
+        return t;
+    }
+  }
+
+  function labelArchiveEventType(t: ArchiveEventRecord["eventType"]): string {
+    switch (t) {
+      case "archive":
+        return "自动归档";
+      case "unarchive":
+        return "取消归档";
       default:
         return t;
     }
@@ -1519,7 +1623,7 @@ export default function App() {
                     <div className="relative min-w-0 flex-1">
                       <IconSearch className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                       <Input
-                        placeholder="搜索微信号 / 用户名 / 系统名称"
+                        placeholder="搜索微信号 / 用户名 / 系统名称 / 技术栈 / 交付物 / 备注"
                         value={query}
                         onChange={(e) => setQuery(e.target.value)}
                         className="h-10 bg-background pl-9"
@@ -2034,6 +2138,44 @@ export default function App() {
 
                   <div className="mt-6">
                     <div className="mb-2 flex items-center justify-between">
+                      <div className="text-sm font-semibold">归档历史</div>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => selected && refreshArchiveEvents(selected.id).catch((e) => showGlobalError(e, "刷新归档历史失败"))}
+                        disabled={!selected}
+                      >
+                        刷新
+                      </Button>
+                    </div>
+                    <div className="rounded-md border">
+                      {archiveEvents.length ? (
+                        <div className="divide-y">
+                          {archiveEvents.map((ev) => (
+                            <div key={ev.id} className="flex items-start justify-between gap-3 p-2 text-sm">
+                              <div className="min-w-0 flex-1">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <Badge variant={ev.eventType === "archive" ? "secondary" : "outline"}>
+                                    {labelArchiveEventType(ev.eventType)}
+                                  </Badge>
+                                  <div className="text-xs text-muted-foreground">{new Date(ev.createdAtMs).toLocaleString()}</div>
+                                  {ev.month ? <div className="font-mono text-xs">{ev.month}</div> : null}
+                                </div>
+                                {ev.reason ? (
+                                  <div className="mt-1 whitespace-pre-wrap text-xs text-muted-foreground">{ev.reason}</div>
+                                ) : null}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="p-2 text-sm text-muted-foreground">暂无归档历史</div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="mt-6">
+                    <div className="mb-2 flex items-center justify-between">
                       <div className="text-sm font-semibold">收款流水</div>
                       <div className="flex items-center gap-2">
                         <Button
@@ -2218,6 +2360,9 @@ export default function App() {
               <div className="mt-2 text-xs text-muted-foreground">
                 统计口径：净收入按收款日期分月汇总（含退款冲减）；归档单数按归档月份统计。
               </div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                当前月份计算时区：{businessTimeZoneMode === "utc" ? "UTC" : `系统本地时区（${systemTimeZone}）`}
+              </div>
             </div>
 
             <div className="mt-4 max-w-[900px] rounded-md border bg-background p-3">
@@ -2249,6 +2394,30 @@ export default function App() {
             <div className="text-sm font-semibold">设置</div>
             <div className="mt-2 text-sm text-muted-foreground">
               运行模式：{tauriRuntime ? "桌面端（Tauri + SQLite）" : "Web Mock（开发演示）"}
+            </div>
+
+            <div className="mt-4 max-w-[720px] rounded-md border bg-background p-3">
+              <div className="text-sm font-semibold">统计时区策略</div>
+              <div className="mt-2 max-w-[320px]">
+                <Select
+                  aria-label="统计时区策略"
+                  value={businessTimeZoneMode}
+                  onChange={(e) => saveBusinessTimeZoneMode(e.target.value as BusinessTimeZoneMode)}
+                  disabled={isSavingBusinessTimeZoneMode}
+                >
+                  <option value="local">系统本地时区（推荐）</option>
+                  <option value="utc">UTC（跨机器更一致）</option>
+                </Select>
+              </div>
+              <div className="mt-2 text-sm text-muted-foreground">
+                当前策略：{businessTimeZoneMode === "utc" ? "UTC" : "系统本地时区"}。
+              </div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                当前设备时区：<span className="font-mono">{systemTimeZone}</span>
+              </div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                影响范围：自动归档月份、月净收入统计、月定金统计。
+              </div>
             </div>
 
             {!tauriRuntime ? (

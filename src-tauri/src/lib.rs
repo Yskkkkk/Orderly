@@ -11,7 +11,7 @@ use tauri::{Manager, State};
 use crate::db::Db;
 use crate::backup::{backup_export, backup_import};
 use crate::orders::{
-    adjustment_add, adjustment_delete, adjustments_list, archive_months_overview, monthly_income_summary,
+    adjustment_add, adjustment_delete, adjustments_list, archive_events_list, archive_months_overview, monthly_income_summary,
     order_create, order_files_list, order_folder_path, order_get, order_hard_delete, order_restore, order_soft_delete,
     order_unarchive, order_update, orders_list, payment_add, payment_delete, payment_update, payments_list,
 };
@@ -62,6 +62,7 @@ pub fn run() {
             order_unarchive,
             archive_months_overview,
             monthly_income_summary,
+            archive_events_list,
             order_folder_path,
             order_files_list,
             payments_list,

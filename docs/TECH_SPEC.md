@@ -1,4 +1,4 @@
-# Orderly（接单记录）技术规范 v1
+# Orderly（接单记录）技术规范 v1.2
 
 ## 0. 背景与目标
 
@@ -9,6 +9,18 @@
 - **本地存储**：使用本地数据库（SQLite），不做云端/服务器。
 
 已确认：UI 使用 **React + shadcn/ui（左右分栏、无深色模式）**。
+
+## 0.1 v1.2 变更摘要（2026-02-23）
+
+- 新增“统计”菜单，支持按月查看归档与净收入，并可跳转到单子筛选。
+- 归档改为系统自动处理：状态转 `done` 自动归档到当月。
+- 已归档订单进入锁定态：禁止编辑、收款、金额调整、删除；需先取消归档。
+- 新增取消归档能力：`order_unarchive`。
+- 月统计口径更新：按收款日期统计当月净收入（含退款冲减），定金单独汇总。
+- 新增归档事件表 `order_archive_events`，用于审计归档/取消归档流程。
+- 订单检索升级为 FTS5，支持 `tech_stack / deliverables / note` 深度搜索。
+- 新增可配置“业务时区策略”（`local`/`utc`），用于归档月份和月统计计算。
+- 新增自动打包工作流（GitHub Actions）：tag/手动触发 `tauri build` 并上传产物。
 
 ## 1. 方案对比（Phase 3）
 
@@ -70,6 +82,7 @@ Orderly/
 - `username`：用户名（微信昵称/备注名）
 - `repo_url`：GitHub 仓库 URL（仅 1 个）
 - `status`：状态（见 4.3）
+- `archive_month`：归档月份（系统字段，`YYYY-MM`，由系统自动维护）
 
 ### 4.2 金额与收款建模（不含税）
 
@@ -100,7 +113,25 @@ Orderly/
 - 默认创建为 `pending_send`
 - 列表筛选支持按 `status`
 
-### 4.4 时间字段与“最近更新时间”
+### 4.4 归档与锁定规则（v1.1）
+
+- 自动归档触发：
+  - 订单创建时若 `status=done`，自动归档到当前月；
+  - 订单状态从非 `done` 变为 `done` 时，自动归档到当前月。
+- 取消归档：
+  - 提供显式“取消归档”操作（`order_unarchive`）；
+  - 取消后订单可编辑，再次变为 `done` 时按当月重新归档。
+- 已归档锁定范围：
+  - 禁止修改订单字段；
+  - 禁止新增/编辑/删除收款；
+  - 禁止新增/删除金额调整；
+  - 禁止软删除/彻底删除。
+- 统计口径：
+  - “当月净收入”按 `payments.paid_at_ms` 所在月份统计（含退款负数冲减）；
+  - “当月定金”仅统计 `payments.type='deposit'` 且同月；
+  - “归档单数”按 `orders.archive_month` 统计。
+
+### 4.5 时间字段与“最近更新时间”
 
 时间存储为 **UTC 毫秒时间戳**（INTEGER）。
 
@@ -119,7 +150,17 @@ Orderly/
 - `created_at_ms` 范围
 - `updated_at_ms` 范围
 
-## 5. SQLite 数据库设计（v1）
+### 4.6 业务时区策略（v1.2）
+
+- 月份计算由设置项 `business_tz_mode` 决定（保存在 `ui_preferences`）：
+  - `local`（默认，推荐）：使用 SQLite `localtime`；
+  - `utc`：使用 SQLite `unixepoch`（UTC）。
+- 影响范围：
+  - 自动归档月份（`archive_month`）；
+  - `monthly_income_summary` 中按月统计净收入与定金。
+- 若跨机器协作，建议统一为 `utc` 以减少系统时区差异带来的月归属偏差。
+
+## 5. SQLite 数据库设计（v1.1）
 
 ### 5.1 表结构（DDL 级别约束）
 
@@ -130,13 +171,16 @@ Orderly/
 - `wechat TEXT NOT NULL`
 - `username TEXT NOT NULL`
 - `repo_url TEXT NOT NULL`
+- `requirement_path TEXT NOT NULL DEFAULT ''`
 - `status TEXT NOT NULL`（`pending_send|done|canceled`）
 - `tech_stack TEXT NOT NULL DEFAULT ''`（v1 使用文本，允许写“Rust,Tauri,SQLite”等）
 - `deliverables TEXT NOT NULL DEFAULT ''`（v1 使用文本）
 - `note TEXT NOT NULL DEFAULT ''`
+- `archive_month TEXT NULL`（系统自动维护）
 - `total_base_cents INTEGER NOT NULL DEFAULT 0`
 - `created_at_ms INTEGER NOT NULL`
 - `updated_at_ms INTEGER NOT NULL`
+- `deleted_at_ms INTEGER NULL`
 
 索引：
 
@@ -146,6 +190,14 @@ Orderly/
 - `idx_orders_status`（status）
 - `idx_orders_created_at`（created_at_ms）
 - `idx_orders_updated_at`（updated_at_ms）
+- `idx_orders_archive_month`（archive_month）
+- `idx_orders_deleted_at`（deleted_at_ms）
+
+全文检索（v1.2）：
+
+- `orders_fts`（FTS5 虚拟表，external content=`orders`）
+- 索引列：`system_name`、`tech_stack`、`deliverables`、`note`
+- 触发器：`orders` 的 INSERT/UPDATE/DELETE 自动同步到 `orders_fts`
 
 #### `payments`
 
@@ -176,6 +228,20 @@ Orderly/
 - `idx_adjustments_order_id`（order_id）
 - `idx_adjustments_at`（at_ms）
 
+#### `order_archive_events`（v1.1）
+
+- `id TEXT PRIMARY KEY`（UUID）
+- `order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE`
+- `event_type TEXT NOT NULL`（`archive|unarchive`）
+- `month TEXT NULL`（`archive` 时记录，`YYYY-MM`）
+- `reason TEXT NOT NULL DEFAULT ''`
+- `created_at_ms INTEGER NOT NULL`
+
+索引：
+
+- `idx_archive_events_order_id`（order_id）
+- `idx_archive_events_created_at`（created_at_ms）
+
 ### 5.2 “最近更新时间”一致性（推荐 DB Trigger）
 
 为防止某些路径漏更新 `updated_at_ms`，建议：
@@ -188,13 +254,14 @@ Orderly/
 ### 6.1 页面/模块
 
 1) **单子列表页（左侧）**
-- 顶部：搜索框（微信号/用户名/系统名称）
+- 顶部：搜索框（微信号/用户名/系统名称 + 技术栈/交付物/备注全文检索）
 - 筛选：状态（待发送/已完成/已取消）、时间范围（创建时间/最近更新时间，日期范围）
 - 列表行：系统名称、微信号、用户名、状态、更新时间
 
 2) **单子详情页（右侧）**
 - 基本信息：系统名称、微信号、用户名、仓库 URL（可点击打开）
 - 支持编辑：修改单子字段后更新 `updated_at`
+- 归档状态：显示归档月份；已归档时进入锁定态，仅允许“取消归档”
 - 金额卡片：总金额（当前）、定金（deposit 汇总）、已收、尾款/多收
 - 收款流水：新增/编辑/删除，支持类型选择（定金/尾款/其他）
 - 金额调整：新增/删除（建议填写理由）
@@ -210,15 +277,26 @@ Orderly/
 - 导出：生成一个 zip（包含 `orderly.db` 与 `orders/`）
 - 恢复：选择 zip，解压替换 `data/`（先备份当前 `data/` 再恢复）
 
+5) **统计页（左侧菜单“统计”）**
+- 月份选择：按月查看汇总
+- 月度卡片：归档单数、当月净收入、当月定金、该月归档单未结
+- 月份列表：点击后跳转回单子页并自动应用归档月份筛选
+
 ## 7. 核心接口定义（Tauri 命令 API）
 
-### 7.1 命令列表（v1）
+### 7.1 命令列表（v1.1）
 
 - `orders_list(filters)` → 列表数据
 - `order_create(payload)` → `{ id }`
 - `order_get(id)` → `{ order, computed }`
 - `order_update(id, patch)` → `ok`
-- `order_set_status(id, status)` → `ok`
+- `order_soft_delete(id)` → `ok`
+- `order_restore(id)` → `ok`
+- `order_hard_delete(id)` → `ok`
+- `order_unarchive(id, reason?)` → `ok`
+- `archive_months_overview()` → `ArchiveMonthOverviewItem[]`
+- `monthly_income_summary(month)` → `MonthlyIncomeSummary`
+- `archive_events_list(order_id)` → `ArchiveEventRecord[]`
 
 - `payment_add(order_id, payload)` → `ok`
 - `payment_update(id, patch)` → `ok`
@@ -236,16 +314,22 @@ Orderly/
 - `backup_export(dest_zip_path)` → `ok`
 - `backup_import(src_zip_path)` → `ok`
 
+- `ui_pref_get(input)` → `UiPrefGetOutput`
+- `ui_pref_set(input)` → `ok`
+
 ## 8. 非功能需求（验收口径：已确认采用推荐值）
 
 - 解压后体积（不含你的附件数据）：建议目标 **≤ 50MB**
 - 空闲内存占用：建议目标 **≤ 200MB**
 - 单子数量：建议目标 **≥ 2000** 条仍可流畅筛选/搜索
 
-## 9. 边界情况与处理策略（v1）
+## 9. 边界情况与处理策略（v1.1）
 
 - 同一微信号/用户名可对应多个单子：允许，不做唯一约束
 - 退款/多收：`payments.amount_cents` 允许负数；尾款负数显示“多收款”
 - 仓库 URL 校验：仅做“非空 + 基本格式提示”，不阻止保存
 - 附件目录为空/不存在：不存在则创建；若被删除则打开详情时自动重建目录
 - 恢复备份失败：保持原 `data/` 不丢失（先备份再替换）
+- 已归档锁定：所有会修改订单业务数据的操作一律拒绝，需先取消归档
+- 历史补归档：启动迁移时对 `status=done && archive_month IS NULL` 数据按 `updated_at_ms` 回填月份
+- 月份统计时区：支持 `local/utc` 切换，跨时区部署建议固定为 `utc`

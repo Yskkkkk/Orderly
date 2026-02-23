@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 use tauri::State;
 use uuid::Uuid;
 
+const BUSINESS_TZ_USER_KEY: &str = "default";
+const BUSINESS_TZ_PAGE_KEY: &str = "orders";
+const BUSINESS_TZ_PREF_KEY: &str = "business_tz_mode";
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderListItem {
@@ -148,6 +152,17 @@ pub struct MonthlyIncomeSummary {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ArchiveEventRecord {
+    pub id: String,
+    pub order_id: String,
+    pub event_type: String,
+    pub month: Option<String>,
+    pub reason: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PaymentRecord {
     pub id: String,
     pub order_id: String,
@@ -270,6 +285,12 @@ pub fn monthly_income_summary(
     month: String,
 ) -> Result<MonthlyIncomeSummary, String> {
     db.with_conn(|conn| monthly_income_summary_impl(conn, &month))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn archive_events_list(db: State<'_, Db>, order_id: String) -> Result<Vec<ArchiveEventRecord>, String> {
+    db.with_conn(|conn| archive_events_list_impl(conn, &order_id))
         .map_err(|e| e.to_string())
 }
 
@@ -402,11 +423,14 @@ FROM orders o
     let mut params: Vec<Value> = Vec::new();
 
     if let Some(q) = filters.q.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        where_parts.push("(o.system_name LIKE ? OR o.wechat LIKE ? OR o.username LIKE ?)");
+        where_parts.push(
+            "(o.system_name LIKE ? OR o.wechat LIKE ? OR o.username LIKE ? OR EXISTS (SELECT 1 FROM orders_fts WHERE orders_fts.rowid = o.rowid AND orders_fts MATCH ?))",
+        );
         let pattern = format!("%{}%", q);
         params.push(Value::from(pattern.clone()));
         params.push(Value::from(pattern.clone()));
         params.push(Value::from(pattern));
+        params.push(Value::from(to_fts_query(q)));
     }
 
     if let Some(status) = filters.status.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -577,7 +601,7 @@ fn order_create_impl(conn: &Connection, id: &str, payload: &OrderCreatePayload) 
     let deliverables = payload.deliverables.clone().unwrap_or_default();
     let note = payload.note.clone().unwrap_or_default();
     let archive_month = if status == "done" {
-        Some(local_month_from_ms(conn, created)?)
+        Some(month_from_ms_by_business_tz(conn, created)?)
     } else {
         None
     };
@@ -650,7 +674,7 @@ WHERE id = ?
     let updated = now_ms();
     let next_status = patch.status.clone().unwrap_or_else(|| current.status.clone());
     let next_archive_month = if current.status != "done" && next_status == "done" {
-        Some(local_month_from_ms(conn, updated)?)
+        Some(month_from_ms_by_business_tz(conn, updated)?)
     } else {
         None
     };
@@ -821,21 +845,25 @@ fn monthly_income_summary_impl(conn: &Connection, month: &str) -> Result<Monthly
         )
     })?;
 
-    let (archived_orders, paid_sum_cents, deposit_sum_cents, outstanding_sum_cents): (i64, i64, i64, i64) =
-        conn.query_row(
-            r#"
+    let paid_month_expr = if business_tz_mode(conn)? == "utc" {
+        "strftime('%Y-%m', p.paid_at_ms / 1000, 'unixepoch')"
+    } else {
+        "strftime('%Y-%m', p.paid_at_ms / 1000, 'unixepoch', 'localtime')"
+    };
+    let sql = format!(
+        r#"
 SELECT
   (SELECT COUNT(*) FROM orders o WHERE o.archive_month = ?) AS archived_orders,
   (
     SELECT COALESCE(SUM(p.amount_cents), 0)
     FROM payments p
-    WHERE strftime('%Y-%m', p.paid_at_ms / 1000, 'unixepoch', 'localtime') = ?
+    WHERE {paid_month_expr} = ?
   ) AS paid_sum_cents,
   (
     SELECT COALESCE(SUM(p.amount_cents), 0)
     FROM payments p
     WHERE p.type = 'deposit'
-      AND strftime('%Y-%m', p.paid_at_ms / 1000, 'unixepoch', 'localtime') = ?
+      AND {paid_month_expr} = ?
   ) AS deposit_sum_cents,
   (
     SELECT COALESCE(SUM(
@@ -846,6 +874,10 @@ SELECT
     WHERE o.archive_month = ?
   ) AS outstanding_sum_cents
 "#,
+    );
+    let (archived_orders, paid_sum_cents, deposit_sum_cents, outstanding_sum_cents): (i64, i64, i64, i64) =
+        conn.query_row(
+            &sql,
             params![normalized, normalized, normalized, normalized],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
@@ -857,6 +889,35 @@ SELECT
         deposit_sum_cents,
         outstanding_sum_cents,
     })
+}
+
+fn archive_events_list_impl(conn: &Connection, order_id: &str) -> Result<Vec<ArchiveEventRecord>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"
+SELECT
+  id, order_id, event_type, month, reason, created_at_ms
+FROM order_archive_events
+WHERE order_id = ?
+ORDER BY created_at_ms DESC
+"#,
+    )?;
+
+    let rows = stmt.query_map(params![order_id], |row| {
+        Ok(ArchiveEventRecord {
+            id: row.get(0)?,
+            order_id: row.get(1)?,
+            event_type: row.get(2)?,
+            month: row.get(3)?,
+            reason: row.get(4)?,
+            created_at_ms: row.get(5)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
 }
 
 fn normalize_payment_type(raw: &str) -> Option<&'static str> {
@@ -1057,12 +1118,58 @@ fn adjustment_delete_impl(conn: &Connection, id: &str) -> Result<(), rusqlite::E
     Ok(())
 }
 
-fn local_month_from_ms(conn: &Connection, at_ms: i64) -> Result<String, rusqlite::Error> {
+fn month_from_ms_by_business_tz(conn: &Connection, at_ms: i64) -> Result<String, rusqlite::Error> {
+    if business_tz_mode(conn)? == "utc" {
+        return conn.query_row(
+            "SELECT strftime('%Y-%m', ? / 1000, 'unixepoch')",
+            params![at_ms],
+            |row| row.get(0),
+        );
+    }
+
     conn.query_row(
         "SELECT strftime('%Y-%m', ? / 1000, 'unixepoch', 'localtime')",
         params![at_ms],
         |row| row.get(0),
     )
+}
+
+fn business_tz_mode(conn: &Connection) -> Result<&'static str, rusqlite::Error> {
+    let pref: Option<String> = conn
+        .query_row(
+            r#"
+SELECT pref_value
+FROM ui_preferences
+WHERE user_key = ? AND page_key = ? AND pref_key = ?
+"#,
+            params![BUSINESS_TZ_USER_KEY, BUSINESS_TZ_PAGE_KEY, BUSINESS_TZ_PREF_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if pref
+        .as_deref()
+        .map(|s| s.trim().eq_ignore_ascii_case("utc"))
+        .unwrap_or(false)
+    {
+        Ok("utc")
+    } else {
+        Ok("local")
+    }
+}
+
+fn to_fts_query(raw: &str) -> String {
+    let mut tokens: Vec<String> = raw
+        .split_whitespace()
+        .map(|s| s.trim_matches(|c: char| c.is_ascii_punctuation()))
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("\"{}\"", s.replace('"', "\"\"")))
+        .collect();
+
+    if tokens.is_empty() {
+        tokens.push(format!("\"{}\"", raw.replace('"', "\"\"")));
+    }
+    tokens.join(" OR ")
 }
 
 fn archived_locked_error() -> rusqlite::Error {
@@ -1106,4 +1213,345 @@ INSERT INTO order_archive_events (
         params![id, order_id, event_type, month, reason, created_at_ms],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::ensure_schema;
+    use rusqlite::Connection;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("open sqlite in memory");
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .expect("enable foreign keys");
+        ensure_schema(&conn).expect("ensure schema");
+        conn
+    }
+
+    fn month_from_ms(conn: &Connection, ms: i64) -> String {
+        conn.query_row(
+            "SELECT strftime('%Y-%m', ? / 1000, 'unixepoch', 'localtime')",
+            params![ms],
+            |row| row.get(0),
+        )
+        .expect("query month")
+    }
+
+    fn month_from_ms_utc(conn: &Connection, ms: i64) -> String {
+        conn.query_row(
+            "SELECT strftime('%Y-%m', ? / 1000, 'unixepoch')",
+            params![ms],
+            |row| row.get(0),
+        )
+        .expect("query utc month")
+    }
+
+    fn month_from_now(conn: &Connection) -> String {
+        conn.query_row(
+            "SELECT strftime('%Y-%m', 'now', 'localtime')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query current month")
+    }
+
+    fn sample_payload(status: &str) -> OrderCreatePayload {
+        OrderCreatePayload {
+            system_name: "system".into(),
+            wechat: "wxid".into(),
+            username: "user".into(),
+            repo_url: "https://github.com/example/repo".into(),
+            requirement_path: Some(String::new()),
+            status: Some(status.into()),
+            tech_stack: Some("Rust".into()),
+            deliverables: Some("zip".into()),
+            note: Some(String::new()),
+            total_base_cents: 100_00,
+        }
+    }
+
+    fn search_filters(q: &str) -> OrdersListFilters {
+        OrdersListFilters {
+            q: Some(q.to_string()),
+            status: None,
+            created_from_ms: None,
+            created_to_ms: None,
+            updated_from_ms: None,
+            updated_to_ms: None,
+            archive_month: None,
+            limit: Some(100),
+            offset: Some(0),
+            deleted_mode: Some("active".to_string()),
+        }
+    }
+
+    fn set_business_tz_mode(conn: &Connection, mode: &str) {
+        conn.execute(
+            r#"
+INSERT INTO ui_preferences (user_key, page_key, pref_key, pref_value, updated_at_ms)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(user_key, page_key, pref_key)
+DO UPDATE SET pref_value = excluded.pref_value, updated_at_ms = excluded.updated_at_ms
+"#,
+            params![
+                BUSINESS_TZ_USER_KEY,
+                BUSINESS_TZ_PAGE_KEY,
+                BUSINESS_TZ_PREF_KEY,
+                mode,
+                now_ms()
+            ],
+        )
+        .expect("set business tz mode");
+    }
+
+    #[test]
+    fn auto_archive_when_create_done() {
+        let conn = test_conn();
+        order_create_impl(&conn, "o1", &sample_payload("done")).expect("create order");
+
+        let month: Option<String> = conn
+            .query_row("SELECT archive_month FROM orders WHERE id = 'o1'", [], |row| row.get(0))
+            .expect("query archive month");
+        assert_eq!(month, Some(month_from_now(&conn)));
+
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM order_archive_events WHERE order_id = 'o1' AND event_type = 'archive'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query event count");
+        assert_eq!(events, 1);
+    }
+
+    #[test]
+    fn auto_archive_when_status_turns_done() {
+        let conn = test_conn();
+        order_create_impl(&conn, "o2", &sample_payload("pending_send")).expect("create order");
+
+        order_update_impl(
+            &conn,
+            "o2",
+            OrderPatch {
+                status: Some("done".into()),
+                system_name: None,
+                wechat: None,
+                username: None,
+                repo_url: None,
+                requirement_path: None,
+                tech_stack: None,
+                deliverables: None,
+                note: None,
+                total_base_cents: None,
+            },
+        )
+        .expect("update order");
+
+        let month: Option<String> = conn
+            .query_row("SELECT archive_month FROM orders WHERE id = 'o2'", [], |row| row.get(0))
+            .expect("query archive month");
+        assert_eq!(month, Some(month_from_now(&conn)));
+    }
+
+    #[test]
+    fn archived_order_is_locked_until_unarchive() {
+        let conn = test_conn();
+        order_create_impl(&conn, "o3", &sample_payload("done")).expect("create done order");
+
+        let update_result = order_update_impl(
+            &conn,
+            "o3",
+            OrderPatch {
+                note: Some("changed".into()),
+                system_name: None,
+                wechat: None,
+                username: None,
+                repo_url: None,
+                requirement_path: None,
+                status: None,
+                tech_stack: None,
+                deliverables: None,
+                total_base_cents: None,
+            },
+        );
+        assert!(update_result.is_err());
+        let err = update_result.err().expect("must error").to_string();
+        assert!(err.contains("ORDER_ARCHIVED_LOCKED"));
+
+        order_unarchive_impl(&conn, "o3", "test").expect("unarchive");
+
+        order_update_impl(
+            &conn,
+            "o3",
+            OrderPatch {
+                note: Some("changed".into()),
+                system_name: None,
+                wechat: None,
+                username: None,
+                repo_url: None,
+                requirement_path: None,
+                status: None,
+                tech_stack: None,
+                deliverables: None,
+                total_base_cents: None,
+            },
+        )
+        .expect("update after unarchive");
+    }
+
+    #[test]
+    fn monthly_income_summary_uses_paid_at_month() {
+        let conn = test_conn();
+        order_create_impl(&conn, "o4", &sample_payload("pending_send")).expect("create order");
+
+        let target_ms = 1_704_067_200_000_i64; // 2024-01-20T00:00:00Z
+        let target_month = month_from_ms(&conn, target_ms);
+
+        payment_add_impl(
+            &conn,
+            "p1",
+            "o4",
+            &PaymentCreatePayload {
+                amount_cents: 120_00,
+                r#type: "deposit".into(),
+                paid_at_ms: target_ms,
+                note: None,
+            },
+        )
+        .expect("add payment");
+
+        payment_add_impl(
+            &conn,
+            "p2",
+            "o4",
+            &PaymentCreatePayload {
+                amount_cents: -20_00,
+                r#type: "other".into(),
+                paid_at_ms: target_ms,
+                note: None,
+            },
+        )
+        .expect("add refund");
+
+        let summary = monthly_income_summary_impl(&conn, &target_month).expect("summary");
+        assert_eq!(summary.month, target_month);
+        assert_eq!(summary.archived_orders, 0);
+        assert_eq!(summary.paid_sum_cents, 100_00);
+        assert_eq!(summary.deposit_sum_cents, 120_00);
+    }
+
+    #[test]
+    fn migration_backfills_done_order_archive_month_by_updated_at() {
+        let conn = test_conn();
+
+        conn.execute(
+            r#"
+INSERT INTO orders (
+  id, system_name, wechat, username, repo_url, requirement_path, status,
+  tech_stack, deliverables, note, archive_month, total_base_cents, created_at_ms, updated_at_ms, deleted_at_ms
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"#,
+            params![
+                "o5",
+                "sys",
+                "wx",
+                "user",
+                "https://github.com/example/r",
+                "",
+                "done",
+                "",
+                "",
+                "",
+                Option::<String>::None,
+                0_i64,
+                1_700_000_000_000_i64,
+                1_704_067_200_000_i64,
+                Option::<i64>::None
+            ],
+        )
+        .expect("insert done order without archive month");
+
+        let before: Option<String> = conn
+            .query_row("SELECT archive_month FROM orders WHERE id='o5'", [], |row| row.get(0))
+            .expect("query before migration");
+        assert_eq!(before, None);
+
+        crate::db::ensure_schema(&conn).expect("re-run schema migration");
+
+        let after: Option<String> = conn
+            .query_row("SELECT archive_month FROM orders WHERE id='o5'", [], |row| row.get(0))
+            .expect("query after migration");
+        assert_eq!(after, Some(month_from_ms(&conn, 1_704_067_200_000_i64)));
+    }
+
+    #[test]
+    fn archive_events_list_returns_archive_and_unarchive() {
+        let conn = test_conn();
+        order_create_impl(&conn, "o6", &sample_payload("done")).expect("create done order");
+        order_unarchive_impl(&conn, "o6", "manual").expect("unarchive");
+
+        let events = archive_events_list_impl(&conn, "o6").expect("list archive events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "unarchive");
+        assert_eq!(events[0].reason, "manual");
+        assert_eq!(events[1].event_type, "archive");
+    }
+
+    #[test]
+    fn monthly_income_summary_respects_utc_policy() {
+        let conn = test_conn();
+        set_business_tz_mode(&conn, "utc");
+        order_create_impl(&conn, "o7", &sample_payload("pending_send")).expect("create order");
+
+        let target_ms = 1_709_251_200_000_i64; // 2024-03-01T00:00:00Z
+        let target_month = month_from_ms_utc(&conn, target_ms);
+
+        payment_add_impl(
+            &conn,
+            "p7",
+            "o7",
+            &PaymentCreatePayload {
+                amount_cents: 66_00,
+                r#type: "other".into(),
+                paid_at_ms: target_ms,
+                note: None,
+            },
+        )
+        .expect("add payment");
+
+        let summary = monthly_income_summary_impl(&conn, &target_month).expect("summary");
+        assert_eq!(summary.paid_sum_cents, 66_00);
+    }
+
+    #[test]
+    fn orders_list_search_matches_fts_fields() {
+        let conn = test_conn();
+        order_create_impl(
+            &conn,
+            "o8",
+            &OrderCreatePayload {
+                system_name: "Alpha".into(),
+                wechat: "wx_alpha".into(),
+                username: "alpha".into(),
+                repo_url: "https://github.com/example/alpha".into(),
+                requirement_path: Some(String::new()),
+                status: Some("pending_send".into()),
+                tech_stack: Some("Rust Tokio".into()),
+                deliverables: Some("Windows installer".into()),
+                note: Some("Supports OCR export".into()),
+                total_base_cents: 100_00,
+            },
+        )
+        .expect("create order o8");
+
+        let by_stack = orders_list_impl(&conn, &search_filters("Tokio")).expect("query by tech stack");
+        assert!(by_stack.iter().any(|o| o.id == "o8"));
+
+        let by_deliverable = orders_list_impl(&conn, &search_filters("installer")).expect("query by deliverables");
+        assert!(by_deliverable.iter().any(|o| o.id == "o8"));
+
+        let by_note = orders_list_impl(&conn, &search_filters("OCR")).expect("query by note");
+        assert!(by_note.iter().any(|o| o.id == "o8"));
+    }
 }

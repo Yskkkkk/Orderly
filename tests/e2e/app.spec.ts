@@ -62,6 +62,18 @@ test("stats menu opens and month card can jump to filtered orders", async ({ pag
   await expect(page.getByTestId("order-row").filter({ hasText: "示例系统 B" })).toBeVisible();
 });
 
+test("business timezone mode can be switched from settings", async ({ page }) => {
+  await page.getByRole("button", { name: "设置" }).click();
+  const tzSelect = page.getByRole("combobox", { name: "统计时区策略" });
+  await expect(tzSelect).toHaveValue("local");
+
+  await tzSelect.selectOption("utc");
+  await expect(tzSelect).toHaveValue("utc");
+
+  await page.getByRole("button", { name: "统计" }).click();
+  await expect(page.getByText("当前月份计算时区：UTC")).toBeVisible();
+});
+
 test("archived order is locked until unarchive", async ({ page }) => {
   page.on("dialog", (dialog) => dialog.accept());
 
@@ -74,6 +86,27 @@ test("archived order is locked until unarchive", async ({ page }) => {
   await page.getByRole("button", { name: "取消归档" }).click();
   await expect(page.getByRole("combobox", { name: "详情状态" })).toBeEnabled();
   await expect(page.getByRole("button", { name: "新增收款" })).toBeEnabled();
+  await expect(page.getByText("归档历史")).toBeVisible();
+  await expect(page.getByText("取消归档")).toBeVisible();
+});
+
+test("archive history records auto-archive and unarchive", async ({ page }) => {
+  page.on("dialog", (dialog) => dialog.accept());
+
+  await page.getByRole("button", { name: "新建单子" }).click();
+  await page.getByLabel("系统名称").fill("归档历史验证单");
+  await page.getByLabel("微信号").fill("wxid_archive_history");
+  await page.getByLabel("用户名").fill("归档用户");
+  await page.getByLabel("GitHub 仓库 URL").fill("https://github.com/example/archive-history");
+  await page.getByLabel("初始总金额（元）").fill("88");
+  await page.getByRole("button", { name: "创建" }).click();
+
+  await page.getByTestId("order-row").filter({ hasText: "归档历史验证单" }).click();
+  await page.getByRole("combobox", { name: "详情状态" }).selectOption("done");
+
+  await expect(page.getByText("自动归档")).toBeVisible();
+  await page.getByRole("button", { name: "取消归档" }).click();
+  await expect(page.getByText("取消归档")).toBeVisible();
 });
 
 test("created date filter supports hit and miss cases", async ({ page }) => {

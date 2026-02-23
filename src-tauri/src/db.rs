@@ -145,6 +145,14 @@ WHERE status = 'done' AND archive_month IS NULL
 "#,
         [],
     )?;
+
+    let orders_count: i64 = conn.query_row("SELECT COUNT(*) FROM orders", [], |row| row.get(0))?;
+    if orders_count > 0 {
+        let fts_count: i64 = conn.query_row("SELECT COUNT(*) FROM orders_fts", [], |row| row.get(0))?;
+        if fts_count == 0 {
+            conn.execute("INSERT INTO orders_fts(orders_fts) VALUES('rebuild')", [])?;
+        }
+    }
     Ok(())
 }
 
@@ -173,6 +181,38 @@ CREATE INDEX IF NOT EXISTS idx_orders_system_name ON orders(system_name);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at_ms);
 CREATE INDEX IF NOT EXISTS idx_orders_updated_at ON orders(updated_at_ms);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS orders_fts USING fts5(
+  system_name,
+  tech_stack,
+  deliverables,
+  note,
+  content='orders',
+  content_rowid='rowid'
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_orders_fts_ai
+AFTER INSERT ON orders
+BEGIN
+  INSERT INTO orders_fts (rowid, system_name, tech_stack, deliverables, note)
+  VALUES (new.rowid, new.system_name, new.tech_stack, new.deliverables, new.note);
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_orders_fts_au
+AFTER UPDATE ON orders
+BEGIN
+  INSERT INTO orders_fts(orders_fts, rowid, system_name, tech_stack, deliverables, note)
+  VALUES ('delete', old.rowid, old.system_name, old.tech_stack, old.deliverables, old.note);
+  INSERT INTO orders_fts (rowid, system_name, tech_stack, deliverables, note)
+  VALUES (new.rowid, new.system_name, new.tech_stack, new.deliverables, new.note);
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_orders_fts_ad
+AFTER DELETE ON orders
+BEGIN
+  INSERT INTO orders_fts(orders_fts, rowid, system_name, tech_stack, deliverables, note)
+  VALUES ('delete', old.rowid, old.system_name, old.tech_stack, old.deliverables, old.note);
+END;
 
 CREATE TABLE IF NOT EXISTS payments (
   id TEXT PRIMARY KEY,

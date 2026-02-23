@@ -63,6 +63,15 @@ type MonthlyIncomeSummary = {
   outstandingSumCents: number;
 };
 
+type ArchiveEventRecord = {
+  id: string;
+  orderId: string;
+  eventType: "archive" | "unarchive";
+  month: string | null;
+  reason: string;
+  createdAtMs: number;
+};
+
 type PaymentType = "deposit" | "final" | "other";
 
 type PaymentRecord = {
@@ -104,6 +113,7 @@ type MockPersistedStateV1 = {
   orders: OrderListItem[];
   paymentsByOrder: Record<string, PaymentRecord[]>;
   adjustmentsByOrder: Record<string, AmountAdjustmentRecord[]>;
+  archiveEventsByOrder?: Record<string, ArchiveEventRecord[]>;
 };
 
 type UiPrefGetInput = {
@@ -153,6 +163,7 @@ function saveMockState() {
       orders,
       paymentsByOrder,
       adjustmentsByOrder,
+      archiveEventsByOrder,
     };
     localStorage.setItem(MOCK_PERSIST_KEY, JSON.stringify(state));
   } catch {
@@ -181,6 +192,7 @@ function loadMockState(): MockPersistedStateV1 | null {
       orders: normalizedOrders,
       paymentsByOrder: parsed.paymentsByOrder as Record<string, PaymentRecord[]>,
       adjustmentsByOrder: parsed.adjustmentsByOrder as Record<string, AmountAdjustmentRecord[]>,
+      archiveEventsByOrder: (parsed.archiveEventsByOrder as Record<string, ArchiveEventRecord[]>) ?? {},
     };
   } catch {
     return null;
@@ -265,12 +277,14 @@ const seedOrders: OrderListItem[] = [
 let orders: OrderListItem[] = [...seedOrders];
 let paymentsByOrder: Record<string, PaymentRecord[]> = {};
 let adjustmentsByOrder: Record<string, AmountAdjustmentRecord[]> = {};
+let archiveEventsByOrder: Record<string, ArchiveEventRecord[]> = {};
 
 const loaded = loadMockState();
 if (loaded) {
   orders = backfillDoneOrderArchiveMonth(loaded.orders);
   paymentsByOrder = loaded.paymentsByOrder;
   adjustmentsByOrder = loaded.adjustmentsByOrder;
+  archiveEventsByOrder = loaded.archiveEventsByOrder ?? {};
 } else {
   orders = backfillDoneOrderArchiveMonth(orders);
   saveMockState();
@@ -280,10 +294,20 @@ function nowMs() {
   return Date.now();
 }
 
-function toMonthValue(ms: number): string {
+function businessTimeZoneMode(): "local" | "utc" {
+  const rec = uiPrefGet({
+    userKey: "default",
+    pageKey: "orders",
+    prefKey: "business_tz_mode",
+  });
+  const mode = String(rec.prefValue ?? "").trim().toLowerCase();
+  return mode === "utc" ? "utc" : "local";
+}
+
+function toMonthValue(ms: number, mode: "local" | "utc" = businessTimeZoneMode()): string {
   const d = new Date(ms);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const y = mode === "utc" ? d.getUTCFullYear() : d.getFullYear();
+  const m = String((mode === "utc" ? d.getUTCMonth() : d.getMonth()) + 1).padStart(2, "0");
   return `${y}-${m}`;
 }
 
@@ -362,11 +386,28 @@ function touchOrder(orderId: string) {
   saveMockState();
 }
 
+function recordArchiveEvent(orderId: string, eventType: "archive" | "unarchive", month: string | null, reason: string, createdAtMs: number) {
+  const rec: ArchiveEventRecord = {
+    id: newId(),
+    orderId,
+    eventType,
+    month,
+    reason,
+    createdAtMs,
+  };
+  const list = archiveEventsByOrder[orderId] ?? [];
+  archiveEventsByOrder[orderId] = [rec, ...list];
+}
+
 function applyFilters(list: OrderListItem[], filters: OrdersListFilters): OrderListItem[] {
   let out = list.map((o) => recomputeOrder(o));
   const q = (filters.q ?? "").trim().toLowerCase();
   if (q) {
-    out = out.filter((o) => [o.systemName, o.wechat, o.username].some((v) => v.toLowerCase().includes(q)));
+    out = out.filter((o) =>
+      [o.systemName, o.wechat, o.username, o.techStack, o.deliverables, o.note].some((v) =>
+        String(v ?? "").toLowerCase().includes(q),
+      ),
+    );
   }
   const status = (filters.status ?? "").trim();
   if (status) out = out.filter((o) => o.status === status);
@@ -471,6 +512,11 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       };
       return out as T;
     }
+    case "archive_events_list": {
+      const orderId = String(args?.orderId ?? "");
+      const out = (archiveEventsByOrder[orderId] ?? []).slice().sort((a, b) => b.createdAtMs - a.createdAtMs);
+      return out as T;
+    }
     case "mock_persistence_get": {
       return getMockPersistEnabled() as T;
     }
@@ -484,6 +530,7 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       orders = backfillDoneOrderArchiveMonth([...seedOrders]);
       paymentsByOrder = {};
       adjustmentsByOrder = {};
+      archiveEventsByOrder = {};
       try {
         localStorage.removeItem(MOCK_PERSIST_KEY);
       } catch {
@@ -609,6 +656,10 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       });
       paymentsByOrder[id] = [];
       adjustmentsByOrder[id] = [];
+      archiveEventsByOrder[id] = [];
+      if (archiveMonth) {
+        recordArchiveEvent(id, "archive", archiveMonth, "status_done_auto", t);
+      }
       orders = [created, ...orders];
       saveMockState();
       return { id } as T;
@@ -644,6 +695,9 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
         outstandingCents: curr.outstandingCents,
       };
       orders = [recomputeOrder(next), ...orders.filter((o) => o.id !== id)];
+      if (nextArchiveMonth) {
+        recordArchiveEvent(id, "archive", nextArchiveMonth, "status_done_auto", updatedAtMs);
+      }
       saveMockState();
       return undefined as T;
     }
@@ -656,6 +710,7 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       const updatedAtMs = nowMs();
       const next = recomputeOrder({ ...curr, archiveMonth: null, updatedAtMs });
       orders = [next, ...orders.filter((o) => o.id !== id)];
+      recordArchiveEvent(id, "unarchive", null, String(args?.reason ?? ""), updatedAtMs);
       saveMockState();
       return undefined as T;
     }
@@ -691,6 +746,7 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       orders = orders.filter((o) => o.id !== id);
       delete paymentsByOrder[id];
       delete adjustmentsByOrder[id];
+      delete archiveEventsByOrder[id];
       if (orders.length === prev) throw new Error("order not found");
       saveMockState();
       return undefined as T;

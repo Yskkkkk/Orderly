@@ -1,130 +1,73 @@
-# Orderly 下一步建议实现计划（基于 docs/NEXT_STEPS.md）
+# Orderly 下一步建议实现计划（v2026-02-23）
 
-> 计划日期：2026-02-19  
+> 计划日期：2026-02-23  
 > 输入文档：`docs/NEXT_STEPS.md`、`docs/TECH_SPEC.md`  
-> 目标：在不破坏“便携/低资源占用”前提下，将 MVP 从“可用”推进到“稳定可长期使用”。
+> 目标：在已完成 P0/P1 的基础上，完成 P2 能力闭环（检索增强、桌面端自动化、自动打包发布）。
 
-## 1. 实施范围与优先级
+## 0. 当前进度（2026-02-23）
 
-| 优先级 | 主题 | 目标结果 |
-|---|---|---|
-| P0 | 错误与校验统一、E2E 补全 | 用户可感知错误、核心主流程可回归 |
-| P1 | 列表性能、交互细节、软删除 | 大数据量可用性和日常效率提升 |
-| P2 | FTS5、桌面 E2E、CI/CD | 检索能力、真实端验证、发布自动化 |
+- [x] A1 文档收口（规范升级）
+- [x] A2 后端规则测试（Rust）
+- [x] A3 CI 质量闸门
+- [x] B1 归档事件可视化
+- [x] B2 时区策略固化（设置页可配置 `local/utc`）
+- [x] B3 发布回归清单
+- [x] C1 FTS5 检索升级（`system_name/tech_stack/deliverables/note`）
+- [ ] C2 桌面端自动化（tauri-driver）
+- [x] C3 自动打包发布（GitHub Actions）
 
-## 2. 分阶段执行计划
+## 1. 当前阶段目标（P2）
 
-### Phase A（P0，1-2 天）：稳定性兜底
+| 优先级 | 主题 | 状态 | 目标结果 |
+|---|---|---|---|
+| P2-1 | FTS5 检索升级 | 已完成 | 深度字段检索可用且有后端测试 |
+| P2-2 | 桌面端自动化 | 进行中（待实施） | 覆盖系统级行为，补足 Mock 差距 |
+| P2-3 | 自动打包发布 | 已完成 | tag/手动触发可产出 Tauri bundle |
 
-#### A1. 统一错误提示与表单校验
+## 2. 下一执行项（C2）
+
+### C2.1 建立 tauri-driver 测试基线
 - 任务：
-  - 新增统一错误处理封装：`src/lib/error.ts`（或并入 `src/lib/backend.ts`）。
-  - `invokeCommand` 统一抛出可读中文错误（含 command 名、后端错误摘要）。
-  - 在 `src/App.tsx` 增加全局 `Alert/Toast` 展示入口。
-  - 新建/编辑订单 Dialog 增加前端校验：
-    - 必填校验：系统名、微信号、用户名、repo URL、初始金额。
-    - repo URL 基础格式校验（提示级，不阻塞业务可按开关配置）。
-    - 金额格式校验（元 -> 分转换失败时给出内联错误）。
+  - 引入 tauri-driver 测试工程（首批 smoke 用例）；
+  - 验证应用可启动、主窗口可交互。
 - 验收：
-  - 人为触发后端错误时，界面出现中文错误提示，且不静默失败。
-  - 非法输入时，Dialog 内联提示明确且可恢复。
+  - 本地与 CI（Windows）均可稳定执行 1 条 smoke。
 
-#### A2. Playwright 用例扩展
-- 任务（`tests/e2e/app.spec.ts`）：
-  - 新增“编辑单子”用例：校验更新时间变化与列表顺序联动。
-  - 新增“日期筛选”命中/不命中双用例。
-  - 新增“金额流水计算”用例：定金 + 收款后金额卡片正确。
-  - 新增“Dialog 溢出可滚动”用例（检查滚动容器存在与可滚动）。
-- 验收：
-  - `pnpm test:e2e` 全绿。
-  - 关键业务流（创建、编辑、筛选、流水）都有自动化覆盖。
-
-### Phase B（P1，3-5 天）：体验与可维护性提升
-
-#### B1. 列表性能优化（优先后端分页）
+### C2.2 覆盖系统级关键链路
 - 任务：
-  - 后端 `orders_list` 支持 `limit/offset` 与稳定排序（按 `updated_at_ms desc`）。
-  - 前端列表增加“加载更多”或分页控件（先不引入虚拟滚动库）。
-  - 补充分页条件下的筛选一致性测试（状态/时间/关键词组合）。
-- 影响文件（预估）：
-  - `src-tauri/src/orders.rs`
-  - `src/App.tsx`
-  - `src/lib/mockBackend.ts`（保持 Web Mock 一致）
+  - 增加“打开目录/文件”可触发验证；
+  - 增加“备份导出 zip”验证；
+  - 增加“恢复备份”基本路径验证。
 - 验收：
-  - 2000 条数据下滚动与筛选无明显卡顿。
-  - 首屏加载时延明显降低，分页行为稳定。
+  - 桌面端关键命令链路具备自动回归能力。
 
-#### B2. 列表/详情细节增强
+### C2.3 接入 CI（独立 Job）
 - 任务：
-  - 微信号、仓库 URL、订单 ID 增加一键复制按钮（`navigator.clipboard`，失败提示降级）。
-  - 详情页支持直接切换状态（调用 `order_update` 或 `order_set_status`）。
-  - 空结果态增加统一空状态组件（文案 + 操作引导）。
+  - 新增桌面端自动化 workflow/job；
+  - 与现有 `ci.yml` 解耦，避免阻塞前后端快速迭代。
 - 验收：
-  - 常用信息可 1 次点击复制。
-  - 状态切换无需打开编辑弹窗，列表与详情同步更新。
+  - 可按需触发，失败信息可直接定位系统级问题。
 
-#### B3. 订单软删除
-- 任务：
-  - 数据库迁移：`orders.deleted_at_ms INTEGER NULL`。
-  - 查询默认过滤已删除；新增“已删除”视图。
-  - 提供恢复与彻底删除（二次确认）能力。
-  - Web Mock 同步字段与行为，避免测试偏差。
-- 影响文件（预估）：
-  - `src-tauri/src/db.rs`（迁移）
-  - `src-tauri/src/orders.rs`
-  - `src/App.tsx`
-  - `src/lib/mockBackend.ts`
-- 验收：
-  - 误删可恢复；彻底删除需二次确认且行为可预测。
+## 3. 已交付物清单
 
-### Phase C（P2，按需排期）：能力增强与交付自动化
+- 代码：
+  - `src-tauri/src/orders.rs`（规则测试、FTS 查询、时区策略）
+  - `src-tauri/src/db.rs`（FTS5 表与触发器）
+  - `src/App.tsx`（时区策略设置项）
+  - `src/lib/mockBackend.ts`（Mock 对齐时区策略与归档事件）
+- 工作流：
+  - `.github/workflows/ci.yml`
+  - `.github/workflows/release-tauri.yml`
+- 文档：
+  - `docs/TECH_SPEC.md`（v1.2）
+  - `docs/NEXT_STEPS.md`
+  - `docs/RELEASE_CHECKLIST.md`
 
-#### C1. 全文检索升级（FTS5）
-- 任务：
-  - 增加 FTS5 表与同步策略（insert/update/delete）。
-  - 查询接口支持普通检索 + FTS 检索融合返回。
-  - 前端展示匹配高亮片段（最小实现可先展示命中字段标签）。
-- 验收：
-  - tech_stack / deliverables / note 可被检索命中。
-  - 与普通筛选组合时结果一致。
+## 4. DoD（当前）
 
-#### C2. 桌面端 E2E（tauri-driver）
-- 任务：
-  - 配置 tauri-driver + WebDriverIO 测试工程。
-  - 覆盖系统行为：打开附件、打开目录、备份导出落盘。
-- 验收：
-  - 在 CI 或本地稳定跑通至少 3 条关键桌面场景。
-
-#### C3. CI/CD 自动打包
-- 任务：
-  - 新增 GitHub Actions：`pnpm install` -> `pnpm tauri build` -> 上传产物。
-  - 产物包含 `portable zip` 与说明文件（`README.txt`）。
-  - 版本号与 release tag 对齐。
-- 验收：
-  - 打 tag 后自动生成可下载产物，无需手工整理。
-
-## 3. 里程碑与交付物
-
-| 里程碑 | 预计完成 | 交付物 |
-|---|---|---|
-| M1（P0 完成） | T+2 天 | 统一错误处理、增强校验、E2E 扩展 |
-| M2（P1 完成） | T+7 天 | 分页/性能、交互增强、软删除 |
-| M3（P2 预研/落地） | T+14 天+ | FTS5、桌面 E2E、CI/CD |
-
-## 4. 风险与缓解
-
-| 风险 | 说明 | 缓解措施 |
-|---|---|---|
-| Mock 与 Tauri 行为偏差 | 前端测试误判 | 每次改后端接口同步改 `mockBackend` |
-| 分页改造引入筛选回归 | 组合条件复杂 | 增加组合筛选 E2E + 后端单元测试 |
-| 软删除迁移影响旧数据 | 现网 DB 无新字段 | 启动时执行幂等迁移并保留备份 |
-| FTS5 复杂度超预期 | SQL 同步与性能调优成本高 | 放在 P2，先做最小闭环 |
-
-## 5. 执行检查清单（DoD）
-
-- [ ] `pnpm test:e2e` 全部通过
-- [ ] `pnpm tauri dev` 可稳定运行，运行模式显示为桌面端
-- [ ] `pnpm tauri build` 成功产出
-- [ ] 文档更新：`docs/NEXT_STEPS.md` 与本计划状态一致
-- [ ] 对外可读变更说明（新增能力、兼容性、已知限制）
-
+- [x] `pnpm exec tsc --noEmit` 通过
+- [x] `cargo test --manifest-path src-tauri/Cargo.toml` 通过
+- [x] `pnpm test:e2e` 通过
+- [x] FTS5 检索与时区策略有测试覆盖
+- [x] 自动打包 workflow 已入库
+- [ ] tauri-driver 首批系统级自动化用例
