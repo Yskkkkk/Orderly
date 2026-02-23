@@ -2,8 +2,9 @@ name: Release Build (Tauri)
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+      - master
   workflow_dispatch:
 
 jobs:
