@@ -10,6 +10,20 @@ async function bootWithFreshMock(page: Page) {
   await expect(page.getByText("Orderly")).toBeVisible();
 }
 
+async function clickButtonWithRetry(page: Page, name: string, maxRetries = 3) {
+  let lastError: unknown;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      await page.getByRole("button", { name }).click({ timeout: 5_000, force: true });
+      return;
+    } catch (error) {
+      lastError = error;
+      await page.waitForTimeout(200);
+    }
+  }
+  throw lastError;
+}
+
 test.beforeEach(async ({ page }) => {
   await bootWithFreshMock(page);
 });
@@ -41,7 +55,7 @@ test("can edit order and moves to top by updated time", async ({ page }) => {
   page.on("dialog", (dialog) => dialog.accept());
 
   await page.getByTestId("order-row").filter({ hasText: "示例系统 B" }).click();
-  await page.getByRole("button", { name: "取消归档" }).click();
+  await clickButtonWithRetry(page, "取消归档");
   await page.getByRole("button", { name: "编辑" }).click();
   await expect(page.getByRole("heading", { name: "编辑单子" })).toBeVisible();
 

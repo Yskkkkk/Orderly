@@ -44,5 +44,18 @@ jobs:
       - name: Test (rust)
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      - name: Ensure E2E port is free
+        shell: pwsh
+        run: |
+          $conn = Get-NetTCPConnection -LocalPort 1420 -ErrorAction SilentlyContinue
+          if ($conn) {
+            $procIds = $conn | Select-Object -ExpandProperty OwningProcess -Unique
+            foreach ($procId in $procIds) {
+              if ($procId -gt 0) {
+                try { Stop-Process -Id $procId -Force -ErrorAction Stop } catch {}
+              }
+            }
+          }
+
       - name: E2E tests
         run: pnpm test:e2e
